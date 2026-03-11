@@ -1,6 +1,7 @@
 
 
 import argparse
+import inspect
 import os
 import torch
 import torch.optim as optim
@@ -19,6 +20,44 @@ from data import MultipleRisksDataset, custom_collate_fn
 from model import GCN_model
 from torch.utils.data import DataLoader
 from online_conformal.saocp import SAOCP
+
+
+def build_trainer(args, ddp_strategy, checkpoint_callback):
+    common_kwargs = dict(
+        default_root_dir=args.logdir,
+        sync_batchnorm=args.gpus > 1,
+        profiler='simple',
+        benchmark=True,
+        log_every_n_steps=1,
+        callbacks=[checkpoint_callback],
+        check_val_every_n_epoch=args.val_every,
+        max_epochs=args.epochs,
+    )
+
+    # PL 1.x path
+    if hasattr(pl.Trainer, "from_argparse_args"):
+        return pl.Trainer.from_argparse_args(
+            args,
+            gpus=args.gpus,
+            accelerator='ddp',
+            strategy=ddp_strategy,
+            **common_kwargs,
+        )
+
+    # PL 2.x path
+    trainer_kwargs = dict(common_kwargs)
+    if args.gpus > 0:
+        trainer_kwargs["accelerator"] = "gpu"
+        trainer_kwargs["devices"] = int(args.gpus)
+        if args.gpus > 1:
+            trainer_kwargs["strategy"] = ddp_strategy
+    else:
+        trainer_kwargs["accelerator"] = "cpu"
+        trainer_kwargs["devices"] = 1
+
+    supported = set(inspect.signature(pl.Trainer.__init__).parameters.keys())
+    trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in supported}
+    return pl.Trainer(**trainer_kwargs)
 
 def compute_nonconformity(preds: torch.Tensor,
                           gts: torch.Tensor,
@@ -452,9 +491,9 @@ class CRTP_CACC_STFA(pl.LightningModule):
         val_total_loss_score = val_total_loss_score / B
         val_total_loss_htsc = val_total_loss_htsc / B
 
-        self.log("val_total_loss", val_total_loss, prog_bar=True)
-        self.log("val_total_loss_score", val_total_loss_score, prog_bar=True)
-        self.log("val_total_loss_htsc", val_total_loss_htsc, prog_bar=True)
+        self.log("val_total_loss", val_total_loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_total_loss_score", val_total_loss_score, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_total_loss_htsc", val_total_loss_htsc, prog_bar=True, on_step=False, on_epoch=True)
         
     def on_save_checkpoint(self, checkpoint: dict) -> dict:
         checkpoint['saocp_class'] = self.class_cps
@@ -471,25 +510,61 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--logdir', type=str, default='log', help='Directory to log data to.')
     parser.add_argument('--gpus', type=int, default=1, help='number of gpus')
-    parser.add_argument('--pretrain_ckpt', type=str, default='/path/to/your/pretrained_risk_category_cls.ckpt', help='Path to pre-trained risk category classifier checkpoint.')
+    parser.add_argument('--num_workers', type=int, default=0, help='Dataloader workers (set 0 in low /dev/shm Docker).')
+    parser.add_argument('--pretrain_ckpt', type=str, default='',
+                        help='Path to pre-trained risk category classifier checkpoint.')
+    parser.add_argument('--input_dir', type=str, default='../data/Risk-Datasets-Venue',
+                        help='Dataset root directory that contains train/ and val/ folders.')
+    parser.add_argument('--resume_ckpt', type=str, default='',
+                        help='Optional checkpoint path to resume training from.')
 
     args = parser.parse_args()
     args.logdir = os.path.join(args.logdir, args.id)
 
-    train_set = MultipleRisksDataset(data_root='/path/to/your/training_data/')
+    train_root = os.path.join(args.input_dir, 'train')
+    val_root = os.path.join(args.input_dir, 'val')
+
+    if not os.path.isdir(train_root):
+        raise FileNotFoundError(f'Train directory not found: {train_root}')
+    if not os.path.isdir(val_root):
+        raise FileNotFoundError(f'Validation directory not found: {val_root}')
+
+    # Dataset loader concatenates paths as `data_root + scenario`, so keep a trailing slash.
+    train_set = MultipleRisksDataset(data_root=os.path.join(train_root, ''))
     print(len(train_set))
-    val_set = MultipleRisksDataset(data_root='/path/to/your/validation_data/')
+    val_set = MultipleRisksDataset(data_root=os.path.join(val_root, ''))
     print(len(val_set))
 
-    dataloader_train = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=8, collate_fn=custom_collate_fn)
-    dataloader_val = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=8, collate_fn=custom_collate_fn)
+    use_pin_memory = args.gpus > 0
+    dataloader_train = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=args.num_workers > 0,
+        collate_fn=custom_collate_fn,
+    )
+    dataloader_val = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=args.num_workers > 0,
+        collate_fn=custom_collate_fn,
+    )
 
     CRTP_CACC_STFA_Model = CRTP_CACC_STFA(args.lr)
 
-    checkpoint = torch.load(args.pretrain_ckpt)
-    state_dict = checkpoint["state_dict"]
-    
-    CRTP_CACC_STFA_Model.load_state_dict(state_dict, strict=False)
+    if args.pretrain_ckpt:
+        if not os.path.isfile(args.pretrain_ckpt):
+            raise FileNotFoundError(f'Pretrained checkpoint not found: {args.pretrain_ckpt}')
+        checkpoint = torch.load(args.pretrain_ckpt)
+        state_dict = checkpoint["state_dict"]
+        CRTP_CACC_STFA_Model.load_state_dict(state_dict, strict=False)
+    elif not args.resume_ckpt:
+        raise ValueError('Either --pretrain_ckpt or --resume_ckpt must be provided.')
 
     for name, param in CRTP_CACC_STFA_Model.named_parameters():    
         if 'risk_type_head' in name:
@@ -501,28 +576,26 @@ if __name__ == "__main__":
             
     CRTP_CACC_STFA_Model.cuda()
     
-    checkpoint_callback = ModelCheckpoint(save_weights_only=False, mode="min", monitor="val_total_loss", save_top_k=2, save_last=True,
-											dirpath=args.logdir, filename="best_{epoch:02d}-{val_total_loss:.3f}")
+    checkpoint_callback = ModelCheckpoint(
+        save_weights_only=False,
+        mode="min",
+        monitor="val_total_loss",
+        save_top_k=2,
+        save_last=True,
+        save_on_train_epoch_end=False,
+        dirpath=args.logdir,
+        filename="best_{epoch:02d}-{val_total_loss:.3f}",
+    )
 	
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
     ddp_strategy = DDPStrategy(find_unused_parameters=True) if 'DDPStrategy' in globals() else DDPPlugin(find_unused_parameters=True)
 
-    trainer = pl.Trainer.from_argparse_args(args,
-                                            default_root_dir=args.logdir,
-                                            gpus = args.gpus,
-                                            accelerator='ddp',
-                                            sync_batchnorm=True,
-                                            strategy=ddp_strategy,
-                                            profiler='simple',
-                                            benchmark=True,
-                                            log_every_n_steps=1,
-                                            flush_logs_every_n_steps=2,
-                                            callbacks=[checkpoint_callback,],
-                                            check_val_every_n_epoch = args.val_every,
-                                            max_epochs = args.epochs
-                                            )
+    trainer = build_trainer(args, ddp_strategy, checkpoint_callback)
 
-    trainer.fit(CRTP_CACC_STFA_Model, dataloader_train, dataloader_val)
+    fit_kwargs = {}
+    if args.resume_ckpt:
+        if not os.path.isfile(args.resume_ckpt):
+            raise FileNotFoundError(f'Resume checkpoint not found: {args.resume_ckpt}')
+        fit_kwargs["ckpt_path"] = args.resume_ckpt
 
-
-
+    trainer.fit(CRTP_CACC_STFA_Model, dataloader_train, dataloader_val, **fit_kwargs)
